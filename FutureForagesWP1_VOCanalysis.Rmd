@@ -1,0 +1,992 @@
+---
+title: "Future Forages WP1 VOC analysis"
+author: "Sarah Christofides"
+licence: "CC-BY"
+date: "8 August 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+
+##Set up the R enviroment
+###Load libraries
+```{r load-libraries}
+library(metacoder)
+library(multivariMate)
+library(mvabund)
+library(randomForest)
+library(vegan)
+```
+
+###Set up colour schemes
+```{r setcol}
+#Set up treatment colours####
+treatcol<-c(
+  #rgb(red=0,green=0,blue=0,maxColorValue=255),#black
+  rgb(red=178,green=255,blue=140,maxColorValue=255),#light green
+  rgb(red=50,green=255,blue=0,maxColorValue=255),#bright green
+  rgb(red=255,green=127,blue=0,maxColorValue=255),#bright orange
+  rgb(red=25,green=178,blue=255,maxColorValue=255),#bright blue
+  rgb(red=229,green=25,blue=50,maxColorValue=255)#red
+)
+
+#Set up variety colours####
+varcol<-c(
+  #rgb(red=0,green=0,blue=0,maxColorValue=255),#black
+  rgb(red=255,green=191,blue=127,maxColorValue=255),#light orange
+  rgb(red=255,green=127,blue=0,maxColorValue=255),#bright orange
+  rgb(red=178,green=255,blue=140,maxColorValue=255),#light green
+  rgb(red=50,green=255,blue=0,maxColorValue=255),#bright green
+  rgb(red=165,green=237,blue=255,maxColorValue=255),#light blue
+  rgb(red=25,green=178,blue=255,maxColorValue=255),#bright blue
+  rgb(red=204,green=191,blue=255,maxColorValue=255),#lilac
+  rgb(red=101,green=76,blue=255,maxColorValue=255),#purple
+  rgb(red=255,green=153,blue=191,maxColorValue=255),#pink
+  rgb(red=229,green=25,blue=50,maxColorValue=255)#red
+)
+
+
+#Set up experiment colours####
+expcol<-(c("black","red","blue"))
+```
+
+#STAtistics for gC-ms Experimental analYsis (StaCEy) v2.0
+StaCEy is a R script for processing outputs from GaVIn (Behrends *et al.*, 2011. *Analytical Biochemistry* 415:206)
+### Step 1. Read in data and get it in the right format
+```{r stacey-analysis-readin}
+#Before starting, delete the RT, expRT and warning lines in Excel
+#Read in data
+gav<-read.csv("integrals_combinedv4.csv",check.names = FALSE)
+colnames(gav)<-gsub("\n", "", colnames(gav))
+
+#Remove warning column
+gav<-gav[,-1]
+#Remove warning and RT rows
+gav<-gav[-(1:3),]
+
+#Save the first column (sample IDs) as row names
+names<-gav[,1]
+gav<-gav[,-1]
+names<-gsub(".CDF", "", names)
+
+summary(gav[,1:10])
+
+#Convert columns from factor to numeric
+gav<-apply(gav,2,as.character)
+gav<-apply(gav,2,as.numeric)
+gav<-as.data.frame(gav)
+
+summary(gav[,1:10])
+
+#Add the sample names as row names
+row.names(gav)<-names
+
+#Load metadata
+metadat<-read.csv("WP1full-metadata.csv")
+metadat$Exp<-as.factor(metadat$Exp)
+#Create combined variety-treatment factor
+metadat$vartreat<-as.factor(paste(metadat$Variety,metadat$Treatment,sep=""))
+
+#Check number of files
+nrow(gav)
+#Check number of compounds
+ncol(gav)
+#Check that the number of files matches the number of samples without including standards
+length(metadat$FileNo[metadat$Treatment!="C8C20"])
+
+#If not - see which is missing
+rownames(gav) %in% metadat$FileNo[metadat$Treatment!="C8C20"]
+#Seems a standard has been included, so remove it
+gav<-gav[rownames(gav)!="190124_17",]
+#Check number of files
+nrow(gav)
+```
+
+###Step 2. Split the data into samples and blanks
+```{r stacey-analysis-split}
+#Create a list of control samples and machine blanks
+contrSamp<-droplevels(metadat$FileNo[metadat$Treatment=="Blank"| metadat$Treatment=="control"])
+
+
+#Create subset of only blanks
+blanks<-(gav[rownames(gav) %in% contrSamp,])
+#Create a subset of only samples
+samples<-(gav[!rownames(gav) %in% contrSamp,])
+
+#Create cut-down version of metadata that only includes the experimental samples
+smetadat<-metadat[metadat$FileNo %in% rownames(samples),]
+smetadat<-droplevels(smetadat)
+
+#Check that the samples are in the same order in the VOC and metadata tables
+#Check the order 
+all.equal(rownames(samples), as.character(smetadat$FileNo))
+#Sort both data frames to correct this
+smetadat<-smetadat[order(smetadat$FileNo),]
+samples<-samples[order(rownames(samples)),]
+#Check again
+all.equal(rownames(samples), as.character(smetadat$FileNo))
+
+#Create cut-down version of metadata that only includes the blank samples
+bmetadat<-metadat[metadat$FileNo %in% rownames(blanks),]
+bmetadat<-droplevels(bmetadat)
+#Add exp level for machine blanks
+bmetadat$Exp<-as.character(bmetadat$Exp)
+bmetadat$Exp[is.na(bmetadat$Exp)]<-"0"
+bmetadat$Exp<-as.factor(bmetadat$Exp)
+
+#Check that the samples are in the same order in the VOC and metadata tables
+#Check the order 
+all.equal(rownames(blanks), as.character(bmetadat$FileNo))
+#Sort both data frames to correct this
+bmetadat<-bmetadat[order(bmetadat$FileNo),]
+blanks<-blanks[order(rownames(blanks)),]
+#Check again
+all.equal(rownames(blanks), as.character(bmetadat$FileNo))
+```
+
+###Step 3. Explore how abundant each compound is in the samples compared to the blanks
+```{r stacey-analysis-blanks}
+#Explore compounds found in blanks
+summary(gav[rownames(gav) %in% contrSamp,])
+
+#Find the maximum value for each compound in any blank
+g.blankMax<-apply(blanks,2,max,na.rm=T)
+#Search sample data for compounds present in the blanks. See how many are more abundant in the sample than the highest blank value
+{namelist<-vector(length=(length(g.blankMax)))
+below<-vector(length=(length(g.blankMax)))
+above<-vector(length=(length(g.blankMax)))
+rmlist<-vector(length=(length(g.blankMax)))
+for (i in 1:length(g.blankMax))
+{
+  nam<-names(g.blankMax[i]) #Find the name of the compound
+  val<-g.blankMax[i]        #Find its highest value in the blanks
+  
+  namelist[i]<-nam
+  below[i]<-sum(samples[,nam] <(val),na.rm=TRUE) #Count the number of occurances in the samples below threshold (max value in blank)
+  above[i]<-sum(samples[,nam] >=(val),na.rm=TRUE) #Count the number of occurances in the samples above threshold
+}
+}
+#See how many instances of each compound were below and how many were above the threshold
+gavfiltering<-cbind(namelist,below,above)
+gavfiltering
+#See which compounds were never higher in the samples than the highest blank value
+gavfiltering[gavfiltering[,3]=="0",1]
+
+#Now focus in on the machine blanks
+#Find the maximum value for each compound in the machine blanks
+g.blankMachine<-apply(blanks[bmetadat$Exp=="0",],2,max,na.rm=T)
+#Search sample data for compounds present in the blanks. See how many are more abundant in the sample than the highest blank value
+{namelist<-vector(length=(length(g.blankMachine)))
+  below.machine<-vector(length=(length(g.blankMachine)))
+  above.machine<-vector(length=(length(g.blankMachine)))
+  rmlist<-vector(length=(length(g.blankMachine)))
+  for (i in 1:length(g.blankMachine))
+  {
+    nam<-names(g.blankMachine[i]) #Find the name of the compound
+    val<-g.blankMachine[i]        #Find its highest value in the blanks
+    
+    namelist[i]<-nam
+    below.machine[i]<-sum(samples[,nam] <(val),na.rm=TRUE) #Count the number of occurances in the samples below threshold (max value in blank)
+    above.machine[i]<-sum(samples[,nam] >=(val),na.rm=TRUE) #Count the number of occurances in the samples above threshold
+  }
+}
+#See how many instances of each compound were below and how many were above the threshold
+gavfiltering.machine<-cbind(namelist,below.machine,above.machine)
+gavfiltering.machine
+#See which compounds were never higher in the samples than the highest blank value
+gavfiltering.machine[gavfiltering.machine[,3]=="0",1]
+#Remove them
+samples<-samples[,gavfiltering.machine[,3]!="0"]
+```
+
+###Step 4. Remove known contaminants
+```{r stacey-analysis-contam}
+#Look at compounds present
+names(samples)
+#Make a list of contaminents
+contam<-c("1,3,5-Trifluorobenzene",
+          "1,2-Benzenedicarboxylic acid",
+          "1,2-Benzenedicarboxylic acid, bis(2-methylpropyl) ester",
+          "2-Propanol, 1-chloro-, phosphate (3:1)",
+          "Acetonitrile",
+          "Benzene, 1,3-dimethyl-",
+          "Benzonitrile",
+          "Cyclodecasiloxane, eicosamethyl-",
+          "Cyclotetrasiloxane, octamethyl-",
+          "Dibutyl phthalate",
+          "Diethyl Phthalate",
+          "Dimethyl phthalate",
+          "Dodecane, 1-chloro-",
+          "Ethylbenzene",
+          "Methylene chloride",
+          "Octane, 2-methyl-",
+          "p-Xylene",
+          "RI=1741.7,  48.8293 min 190122_18",
+          "RI=2032.9,  56.3506 min 190122_18",
+          "Silane, dimethoxydimethyl-",
+          "Silanediol, dimethyl-",
+          "Siloxane1",
+          "Siloxane2",
+          "Siloxane3",
+          "Siloxane4",
+          "Tetradecane, 1-chloro-")
+#Remove them
+samples<-samples[,!names(samples) %in% contam]
+
+#Remove pentane and octane as they exceeded detection limit
+samples<-samples[,!names(samples) %in% c("Pentane","Octane")]
+
+#Rename compounds marked only with RI
+{colnames(samples)[colnames(samples)=="RI=1005.6,  23.4950 min 190126_9"]<-"Alkene1"
+colnames(samples)[colnames(samples)=="RI=1012.0,  23.7633 min 190214_13"]<-"Alkene2"
+colnames(samples)[colnames(samples)=="RI=1439.7,  39.7840 min 190124_3"]<-"Alkene3"
+colnames(samples)[colnames(samples)=="RI=1818.0,  50.9000 min 190129_12"]<-"Acid1"
+colnames(samples)[colnames(samples)=="RI=2202.5,  60.5763 min 190213_10"]<-"Alcohol1"
+colnames(samples)[colnames(samples)=="RI=872.2,  17.4033 min 190127_14"]<-"Amide1"
+colnames(samples)[colnames(samples)=="RI=1972.2,  54.8386 min 190129_9"]<-"Sulfone1"
+colnames(samples)[colnames(samples)=="RI=2153.0,  59.3436 min 190212_4"]<-"Biphenyl1"
+colnames(samples)<-gsub(" - custom","",colnames(samples))
+}
+
+```
+
+###Step 5. Remove any compounds that don’t occur in all replicates of at least one treatment group
+```{r stacey-analysis-sporadic}
+#Identify compounds which are unreliably found across few samples
+#Load in parameter file and export it for exploration in GaVIn
+#param<-read.csv("parameterSet_combined190618.csv")
+#param$name<-gsub("\n", "", param$name)
+#param2<-param[param$name %in% names(samples),]
+#write.csv(param2,"parameterSet_filtered.csv")
+
+#Go with conservative estimate of 45 000 for baseline area
+#45 000 x 5 = 225 000
+
+#Look how many samples per compound are below 225 000
+over<-apply(samples,2,function(x) sum(x >225000))
+under<-apply(samples,2,function(x) sum(x <225000))
+cbind(over,under)
+#For every compound, count for how many of the treatment/variety combinations it occurs in all 3 reps
+frequency<-data.frame(name = 1:ncol(samples), found = 1:ncol(samples))
+for (i in 1:ncol(samples)){
+  n.found<-(sapply(levels(smetadat$vartreat),function(x) sum(samples[smetadat$vartreat==x,i]>225000)))
+  frequency$name[i]<-names(samples)[i]
+  frequency$found[i]<-sum(n.found>2)
+}
+#View which compounds were not found in all three reps of any treatment
+frequency[frequency$found==0,1]
+#Remove them
+samples<-samples[,!names(samples) %in% frequency[frequency$found==0,1]]
+
+#Replace any zeros with a nominal low value (10 000)
+samples<-as.data.frame(apply(samples,2,function(x)replace(x,x==0, 10000)))
+
+#Replace AMDIS names with IUPAC names
+iupac<-read.csv("Name-comparison.csv")
+iupac$AMDIS.name<-gsub(" $", "", iupac$AMDIS.name)
+sum(names(samples) %in% iupac$AMDIS.name)
+sum(!names(samples) %in% iupac$AMDIS.name)
+
+sum(!iupac$AMDIS.name %in% names(samples))
+iupac<-iupac[iupac$AMDIS.name %in% names(samples),]
+#Check that the list is identical to the order of columns in the dataframe
+all.equal(names(samples), iupac$AMDIS.name)
+#Do the replacement
+names(samples)<-iupac$IUPAC.name
+```
+
+###Step 7. Normalise data per sample by converting to %
+```{r stacey-analysis-normalise}
+#Normalise data by expressing each observation as a percentage of total area for that sample (row)
+#Use percentage rather than proportion as mvabund struggles with responses <1
+samples<-as.data.frame(prop.table(as.matrix(samples),1))*100
+```
+###Step 8. Export the data####
+```{r stacey-analysis-export}
+#Export the normalised data
+write.csv(samples, "VOC-samples.csv", row.names = F)
+#Export the metadata
+write.csv(smetadat, "VOC-metadata.csv", row.names = F)
+#If you prefer, export them both in one file
+write.csv(cbind(smetadat, samples), "VOC-samples-metadata.csv", row.names = F)
+```
+#Metacoder plots
+###Plot a heat tree of all the compounds found across all samples Documentation at https://grunwaldlab.github.io/metacoder_documentation/index.html
+```{r overall-metacoder}
+#Invert data
+metasamp<-as.data.frame(t(samples))
+#rownames(metasamp)<-iupac$IUPAC.name
+#Remove observations accounting for <0.001% of each sample
+metasamp<-as.data.frame(apply(metasamp,2,function(x)replace(x,x<0.001, NA)))
+
+#Read in classification data
+chemtax<-read.csv("chemtax.csv")
+#Check compound names match
+rownames(metasamp)[!rownames(metasamp) %in% chemtax$IUPAC.name]
+chemtax$IUPAC.name[!chemtax$IUPAC.name %in% rownames(metasamp)]
+
+chemtax<-chemtax[chemtax$IUPAC.name %in% rownames(metasamp),]
+
+#Put them in the same order
+chemtax<-chemtax[order(match(chemtax$IUPAC.name,rownames(metasamp))),]
+#Check that the order is the same
+all.equal(as.character(chemtax$IUPAC.name), as.character(rownames(metasamp)), check.attributes = FALSE)
+
+
+chemtax$Taxon<-paste("l0_",chemtax$Root,"|l1_",chemtax$Level1,"|l2_",chemtax$Level2,"|l3_",chemtax$Level3,"|l4_",chemtax$Level4,"|l5_",chemtax$IUPAC.name,sep="")
+
+#Add taxonomy column to the data frame
+metasamp$taxonomy<-chemtax$Taxon
+
+#Create taxmap object
+voctaxmap <- parse_tax_data(metasamp,
+                             class_cols = "taxonomy", # The column in the input table
+                             class_sep = "|", # What each taxon is seperated by
+                             class_regex = "([a-z]{1}[0-9]{1})_(.*)",
+                             class_key = c("tax_rank" = "taxon_rank", "name" = "taxon_name"))
+voctaxmap
+
+#Calculate abundance for each compound/group
+voctaxmap$data$tax_abund <- calc_taxon_abund(voctaxmap, "tax_data", cols = smetadat$FileNo)
+voctaxmap$data$sum_abund <- rowSums(voctaxmap$data$tax_abund[,-1])
+names(voctaxmap$data$sum_abund)<-taxon_ids(voctaxmap)
+
+group_abund<-data.frame(cbind(taxon_names(voctaxmap), taxon_ranks(voctaxmap), voctaxmap$data$sum_abund))
+names(group_abund)<-c("Name", "Rank", "Abundance")
+group_abund$Abundance<-as.character(group_abund$Abundance)
+group_abund$Abundance<-as.numeric(group_abund$Abundance)
+group_abund$Proportion<-round(group_abund$Abundance*100/group_abund$Abundance[1], 0)
+group_abund$Membership<-n_leaves(voctaxmap)
+
+group_abund<-group_abund[order(group_abund$Rank, group_abund$Abundance, decreasing = c(F,T), method = "radix"),]
+
+group_abund[group_abund$Rank == "l1",]
+
+#Overall heat tree
+set.seed(47)
+voctaxmap %>%
+  heat_tree(node_size = sum_abund,
+            node_color = sum_abund,
+            node_color_axis_label = "Relative abundance",
+            node_label_size_trans = "log10 area",
+            initial_layout = "re", layout = "da",
+            overlap_avoidance = 0.76,
+            node_label = ifelse(taxon_ranks != "l5", as.character(name), NA))
+```
+
+###Differential heat trees for treatment
+```{r metacoder-matrix}
+#Calculate the mean difference between treatments for each compound, normalised to compound abundance
+voctaxmap$data$diff_table <- compare_groups(voctaxmap,
+                                           data = "tax_abund",
+                                           cols = smetadat$FileNo,
+                                           groups = smetadat$Treatment,
+                                           func = function(abund1, abund2) 
+                                             list(mean_diff = (mean(abund1) - mean(abund2)) / mean (abund1)))
+
+#Put comparisons in the correct order
+voctaxmap$data$diff_table<-voctaxmap$data$diff_table[with(voctaxmap$data$diff_table, order(treatment_1,treatment_2)),]
+
+#Check min and max values
+min(voctaxmap$data$diff_table$mean_diff)
+max(voctaxmap$data$diff_table$mean_diff)
+
+#List which compounds/ groups have the largest difference
+difflist<-sapply(voctaxmap$edge_list$to, function(x) 
+ any(voctaxmap$data$diff_table$mean_diff[voctaxmap$data$diff_table$taxon_id==x] > 1 ) ||
+ any(voctaxmap$data$diff_table$mean_diff[voctaxmap$data$diff_table$taxon_id==x] < -1 ))
+names(difflist)<-voctaxmap$edge_list$to
+
+#Draw heat tree matrix
+voctaxmap2<-filter_taxa(voctaxmap, difflist, supertaxa = T, reassign_obs = F)
+#voctaxmap2$data$diff_table<-aggregate(mean_diff~taxon_id+treatment_1+treatment_2, FUN = sum, data = voctaxmap2$data$diff_table)
+voctaxmap2 %>%
+  heat_tree_matrix(data = "diff_table",
+                   seed = 47,
+                   node_size = sum_abund, #Use total abundance
+                   node_label = as.character(taxon_names),
+                   node_label_size_trans = "log10 area",
+                   node_label_size_range = c(0.02, 0.03),
+                   node_color = mean_diff,
+                   node_color_range = c("#FF2A00","#DDDDDD","#002AFF"),
+                   node_color_trans = "area",
+                   node_color_interval = c(-6, 6),
+                   edge_color_interval = c(-6, 6),
+                   row_label_color = "#002AFF",
+                   col_label_color = "#DD2A00",
+                   overlap_avoidance = 0.73,
+                   node_size_axis_label = "Relative abundance",
+                   node_color_axis_label = "Mean difference",
+                   key_size = 0.78,
+                   output_file = "./Results/Fig2.1.pdf")
+```
+#Multivariate linear model
+###Model VOC profiles using mvabund
+```{r-mvabund-model}
+#Log10 transform data
+logvoc<-log10(samples)
+##Create an mvabund object
+logmvvoc <- mvabund(logvoc, row.names=row.names(logvoc), check.rows=TRUE, check.names=TRUE,
+                    var.names=colnames(logvoc), neg=TRUE, na.rm=FALSE )
+
+#Run the model
+mvmod <- manylm(logmvvoc~smetadat$Variety + smetadat$Treatment + smetadat$Exp + smetadat$Variety:smetadat$Treatment)
+plot(mvmod, res.type="pit.norm", which=1:3, caption=c("Residuals vs Fitted", "Normal Q-Q", "Scale-Location"), overlay=TRUE)
+qqnorm(resid(mvmod,type = "pearson"));qqline(resid(mvmod,type = "pearson"))
+
+pdf("log10.pdf", width = 24, height = 24)
+par(mfrow=c(18,10),mar=c(1,1,1,1))
+for (i in 1:177){
+  qqnorm(residuals(mvmod,type = "pearson")[,i],col=metadat$Treatment);qqline(residuals(mvmod,type = "pearson")[,i])
+}
+dev.off()
+
+mvmod$coefficients
+
+#Look at overall significance of each term
+#Variety
+mvmod.var <- manylm(logmvvoc~smetadat$Treatment + smetadat$Exp + smetadat$Variety +  smetadat$Variety:smetadat$Treatment)
+voc.aov.var<-anova.manylm(mvmod.var, resamp="perm.resid",p.uni="adjusted", test="LR", cor.type="I") 
+voc.aov.var$table
+#Treatment
+mvmod.treat <- manylm(logmvvoc~smetadat$Variety + smetadat$Exp + smetadat$Treatment + smetadat$Variety:smetadat$Treatment)
+voc.aov.treat<-anova.manylm(mvmod.treat, resamp="perm.resid",p.uni="adjusted", test="LR", cor.type="I") 
+voc.aov.treat$table
+#Experiment
+voc.aov.exp<-anova.manylm(mvmod, resamp="perm.resid",p.uni="adjusted", test="LR", cor.type="I") 
+voc.aov.exp$table
+#Check if any LR values are <0
+voc.aov.var$uni.test[(voc.aov.var$uni.test<0 & !is.na(voc.aov.var$uni.test))]
+voc.aov.treat$uni.test[(voc.aov.treat$uni.test<0 & !is.na(voc.aov.treat$uni.test))]
+voc.aov.exp$uni.test[(voc.aov.exp$uni.test<0 & !is.na(voc.aov.exp$uni.test))]
+
+#Combine into one results table
+full.aov<-rbind(voc.aov.var$table[c(1,4),],voc.aov.treat$table[4,],voc.aov.exp$table[4:5,])
+rownames(full.aov)<-c("Intercept", "Variety", "Treatment", "Experiment", "Variety:Treatment")
+full.aov
+```
+
+###Do pairwise comparisons between varieties
+```{r pairwise-variety}
+#Pairwise tests for variety
+varcomplist<-data.frame(ACAD = c("AberClyde", "AberDart"), 
+                        ACAE = c("AberClyde", "AberEcho"), 
+                        ACAG = c("AberClyde", "AberGlyn"), 
+                        ACAN = c("AberClyde", "AberNiche"), 
+                        ACAZ = c("AberClyde", "AberZeus"), 
+                        ACBa = c("AberClyde", "Barolex"), 
+                        ACBx = c("AberClyde", "Bx511"), 
+                        ACDV = c("AberClyde", "DaVinci"), 
+                        ACPr = c("AberClyde", "Premium"), 
+                        ADAE = c("AberDart", "AberEcho"), 
+                        ADAG = c("AberDart", "AberGlyn"), 
+                        ADAN = c("AberDart", "AberNiche"), 
+                        ADAZ = c("AberDart", "AberZeus"), 
+                        ADBa = c("AberDart", "Barolex"), 
+                        ADBx = c("AberDart", "Bx511"), 
+                        ADDV = c("AberDart", "DaVinci"), 
+                        ADPr = c("AberDart", "Premium"),
+                        AEAG = c("AberEcho", "AberGlyn"), 
+                        AEAN = c("AberEcho", "AberNiche"), 
+                        AEAZ = c("AberEcho", "AberZeus"), 
+                        AEBa = c("AberEcho", "Barolex"), 
+                        AEBx = c("AberEcho", "Bx511"), 
+                        AEDV = c("AberEcho", "DaVinci"), 
+                        AEPr = c("AberEcho", "Premium"),
+                        AGAN = c("AberGlyn", "AberNiche"), 
+                        AGAZ = c("AberGlyn", "AberZeus"), 
+                        AGBa = c("AberGlyn", "Barolex"), 
+                        AGBx = c("AberGlyn", "Bx511"), 
+                        AGDV = c("AberGlyn", "DaVinci"), 
+                        AGPr = c("AberGlyn", "Premium"),
+                        ANAZ = c("AberNiche", "AberZeus"), 
+                        ANBa = c("AberNiche", "Barolex"), 
+                        ANBx = c("AberNiche", "Bx511"), 
+                        ANDV = c("AberNiche", "DaVinci"), 
+                        ANPr = c("AberNiche", "Premium"),
+                        AZBa = c("AberZeus", "Barolex"), 
+                        AZBx = c("AberZeus", "Bx511"), 
+                        AZDV = c("AberZeus", "DaVinci"), 
+                        AZPr = c("AberZeus", "Premium"),
+                        BaBx = c("Barolex", "Bx511"), 
+                        BaDV = c("Barolex", "DaVinci"), 
+                        BaPr = c("Barolex", "Premium"),
+                        BxDV = c("Bx511", "DaVinci"), 
+                        BxPr = c("Bx511", "Premium"),
+                        DVPr = c("DaVinci", "Premium"))
+#Initialise matrix for results
+pairwise.var<-matrix(NA, ncol = 7, nrow = ncol(varcomplist),
+                       dimnames = list(c(),
+                                       c("Comp1", "Comp2", "Res.DF", "Df.diff", "LR", "P", "P.adj")))
+#Do the comparisons
+for (i in 1:ncol(varcomplist)) { 
+  print(paste("Comparing", varcomplist[1,i], "against", varcomplist[2,i]))
+  cutmet<-droplevels(smetadat[smetadat$Variety %in% varcomplist[,i],]) #Create metadata subset
+  cutdat<-samples[row.names(samples) %in% cutmet$FileNo,] #Create data subset
+  cutmvvoc <- mvabund(cutdat, row.names=row.names(cutdat), check.rows=TRUE, check.names=TRUE,
+                      var.names=colnames(cutdat), neg=TRUE, na.rm=FALSE ) #Create an mvabund object
+  pairmod<-manylm(cutmvvoc~cutmet$Exp + cutmet$Treatment + cutmet$Variety) #Run model
+  cut.aov<-anova.manylm(pairmod, resamp="perm.resid",p.uni="adjusted", test="LR", cor.type="I") 
+  if(sum(cut.aov$uni.test[(cut.aov$uni.test<0 & !is.na(cut.aov$uni.test))]) != "0") 
+    print("Warning! Negative LR values") #Check if any LR values are <0
+  adj.p<-p.adjust(cut.aov$table[4,4], method = "BH", n = ncol(varcomplist)) #Adjust P-value for variety
+  print(cbind(cut.aov$table[4,], adj.p))
+  pairwise.var[i,]<-cbind(paste(varcomplist[1,i]), paste(varcomplist[2,i]), 
+                            as.matrix(cut.aov$table[4,]), adj.p) #Add to the matrix
+}
+
+#View full results list
+pairwise.var
+
+#Create a table of LR and adjusted P values
+var.matrix<-matrix(nrow = length(levels(smetadat$Variety)), 
+                   ncol = length(levels(smetadat$Variety)[-1])*2, byrow = TRUE,
+                   dimnames = list(levels(smetadat$Variety),
+                               c(paste(levels(smetadat$Variety)[-1],"LR", sep = ""),
+                               paste(levels(smetadat$Variety)[-1],"P.adj", sep = ""))))
+var.matrix<-var.matrix[,order(colnames(var.matrix))]
+
+for (i in 1:length(varcomplist)) {
+  v1<-pairwise.var[i,1]
+  v2<-pairwise.var[i,2]
+  var.matrix[v1,paste(v2,"LR",sep="")]<-pairwise.var[i,5]
+  var.matrix[v1,paste(v2,"P.adj",sep="")]<-pairwise.var[i,7]
+}
+var.matrix<-apply(var.matrix, 2, as.numeric)
+var.matrix<-apply(var.matrix, 2, signif, digits = 3)
+write.csv(var.matrix,"var.matrix.csv")
+```
+
+###Do pairwise comparisons between treatments
+```{r pairwise-treatment}
+#Pairwise tests for treatment####
+treatcomplist<-data.frame(c20c50 = c("cntr20", "cntr50"), 
+                     c20dr = c("cntr20", "drought"), 
+                     c20fl = c("cntr20", "flood"), 
+                     c20ht = c("cntr20", "heat"), 
+                     c50dr = c("cntr50", "drought"), 
+                     c50fl = c("cntr50", "flood"), 
+                     c50ht = c("cntr50", "heat"), 
+                     drfl = c("drought", "flood"), 
+                     drht = c("drought", "heat"), 
+                     flht = c("flood", "heat"))
+#Initialise matrix for results
+pairwise.treat<-matrix(NA, ncol = 7, nrow = ncol(treatcomplist),
+                       dimnames = list(c(),
+                                       c("Comp1", "Comp2", "Res.DF", "Df.diff", "LR", "P", "P.adj")))
+#Do the comparisons
+for (i in 1:ncol(treatcomplist)) { 
+  print(paste("Comparing", treatcomplist[1,i], "against", treatcomplist[2,i]))
+  cutmet<-droplevels(smetadat[smetadat$Treatment %in% treatcomplist[,i],]) #Create metadata subset
+  cutdat<-samples[row.names(samples) %in% cutmet$FileNo,] #Create data subset
+  cutmvvoc <- mvabund(cutdat, row.names=row.names(cutdat), check.rows=TRUE, check.names=TRUE,
+                      var.names=colnames(cutdat), neg=TRUE, na.rm=FALSE ) #Create an mvabund object
+  pairmod<-manylm(cutmvvoc~cutmet$Variety + cutmet$Exp + cutmet$Treatment) #Run model
+  cut.aov<-anova.manylm(pairmod, resamp="perm.resid",p.uni="adjusted", test="LR", cor.type="I") 
+  if(sum(cut.aov$uni.test[(cut.aov$uni.test<0 & !is.na(cut.aov$uni.test))]) != "0") 
+    print("Warning! Negative LR values") #Check if any LR values are <0
+  adj.p<-p.adjust(cut.aov$table[4,4], method = "BH", n = ncol(treatcomplist)) #Adjust P-value for treatment
+  print(cbind(cut.aov$table[4,], adj.p))
+  pairwise.treat[i,]<-cbind(paste(treatcomplist[1,i]), paste(treatcomplist[2,i]), 
+                            as.matrix(cut.aov$table[4,]), adj.p) #Add to the matrix
+}
+
+pairwise.treat
+
+#Create a table of LR and adjusted P values
+treat.matrix<-matrix(nrow = length(levels(smetadat$Treatment)), 
+                   ncol = length(levels(smetadat$Treatment)[-1])*2, byrow = TRUE,
+                   dimnames = list(levels(smetadat$Treatment),
+                               c(paste(levels(smetadat$Treatment)[-1],"LR", sep = ""),
+                               paste(levels(smetadat$Treatment)[-1],"P.adj", sep = ""))))
+treat.matrix<-treat.matrix[,order(colnames(treat.matrix))]
+
+for (i in 1:length(treatcomplist)) {
+  v1<-pairwise.treat[i,1]
+  v2<-pairwise.treat[i,2]
+  treat.matrix[v1,paste(v2,"LR",sep="")]<-pairwise.treat[i,5]
+  treat.matrix[v1,paste(v2,"P.adj",sep="")]<-pairwise.treat[i,7]
+}
+treat.matrix<-apply(treat.matrix, 2, as.numeric)
+treat.matrix<-apply(treat.matrix, 2, signif, digits = 3)
+write.csv(treat.matrix,"treat.matrix.csv")
+
+```
+#RandomForests
+Build predictive classifiers for the data.
+Documentation at https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm
+###Variety random forest
+```{r randomForest-variety}
+#Optimise number of trees
+plot(randomForest(samples, y=smetadat$Variety, proximity = F, keep.forest = F, ntree=100000))
+#Optimise number of variables m (substitute your choice of tree number for ntree)
+cv.var<-rfcv(samples, smetadat$Variety, cv.fold = 10, ntree = 40000)
+plot(cv.var$error.cv~cv.var$n.var, type = "S", xlab = "No. variables", ylab = "Error rate", ylim = c(0,1), main = "RFCV")
+
+#Run random forest
+varRF<-randomForest(samples, smetadat$Variety, importance = T, proximity = T, mtry = 25, ntree=100000, keep.forest = TRUE)
+varRF
+
+plot(varRF)
+
+#Plotit
+plotx<-MDSplot(varRF, smetadat$Variety,palette = varcol, xlim = c(-0.7,0.6), ylim = c(-0.6,0.65))
+ordiellipse(plotx, smetadat$Variety,conf=0.95,col=varcol,lwd=2,draw="lines")
+legend("topleft",  c(levels(smetadat$Variety)), pch=c(20), bty="n", cex=0.8, col=varcol)
+```
+
+###Treatment random forest
+```{r randomForest-treatment}
+#Optimise number of trees
+plot(randomForest(samples, y=smetadat$Treatment, proximity = F, keep.forest = F, ntree=500000))
+#Optimise number of variables m (substitute your choice of tree number for ntree)
+cv.treat<-rfcv(samples, smetadat$Treatment, cv.fold = 10, ntree = 3000)
+plot(cv.treat$error.cv~cv.treat$n.var, type = "S", xlab = "No. variables", ylab = "Error rate", ylim = c(0,1), main = "RFCV")
+
+#Run random forest
+treatRF<-randomForest(samples, smetadat$Treatment, importance = T, proximity = T, mtry = 100, ntree=100000, keep.forest = TRUE)
+treatRF
+
+plot(treatRF)
+
+#Plotit
+plotx<-MDSplot(treatRF, smetadat$Treatment,palette = treatcol, xlim = c(-0.7,0.6), ylim = c(-0.6,0.65))
+ordiellipse(plotx, smetadat$Treatment,conf=0.95,col=treatcol,lwd=2,draw="lines")
+legend("topleft",  c("Control 2020", "Control 2050","Drought","Flood","Heat"), pch=c(20), bty="n", cex=0.8, col=treatcol)
+
+#Take the 25 most important compounds
+varImpPlot(treatRF)
+treatcomp<-as.data.frame(importance(treatRF))
+treatcomp<-treatcomp[order(treatcomp$MeanDecreaseAccuracy, decreasing = T),]
+treatcomp[1:25,]
+treatcomp2<-as.data.frame(importance(randomForest(samples, smetadat$Treatment, importance = T, mtry = 100, ntree=30000)))
+treatcomp2<-treatcomp2[order(treatcomp2$MeanDecreaseAccuracy, decreasing = T),]
+sum(rownames(treatcomp)[1:25] %in% rownames(treatcomp2)[1:25])
+
+oldcomp<-c("3-Pentanol",
+"2,4-Hexadiene, (E,Z)-",
+    "1,3-Pentadiene",
+"1,3-Octadiene",
+"3-Ethyl-1,5-octadiene",
+"1-Penten-3-ol",
+"2-Methyl-1-butene",
+"Acid1",
+"2,4-Dimethylfuran",
+"Methanethiol",
+"1-Butene, 3-methyl-",
+    "1-Dodecanethiol",
+"2-Pentene, (E)-",
+    "Benzonitrile",
+"Isoprene",
+"Ethanol",
+"2-Heptene, (E)-",
+    "Butanoic acid, ethyl ester",
+"1-Butanol, 3-methyl-",
+    "3-Pentanone",
+"3-Hexene, (Z)-",
+    "2-Pentanone, 3-methyl-",
+    "2-Butenal",
+"2-Octene, (E)-")
+sum(rownames(treatcomp)[1:25] %in% iupac$IUPAC.name[match(oldcomp, iupac$AMDIS.name)])
+#Compounds in old and new
+rownames(treatcomp)[1:25][rownames(treatcomp)[1:25] %in% iupac$IUPAC.name[match(oldcomp, iupac$AMDIS.name)]]
+#Compounds only in new
+rownames(treatcomp)[1:25][!rownames(treatcomp)[1:25] %in% iupac$IUPAC.name[match(oldcomp, iupac$AMDIS.name)]]
+#Compounds only in old
+oldcomp[!iupac$IUPAC.name[match(oldcomp, iupac$AMDIS.name)] %in% rownames(treatcomp)[1:25]]
+
+#Make another random forest with them
+treat25<-samples[,names(samples) %in% row.names(treatcomp)[1:25]]
+treat25RF<-randomForest(treat25, y=smetadat$Treatment, importance = T, proximity = T, ntree=200000)
+plot(treat25RF)
+treat25RF
+#Plotit
+plotx<-MDSplot(treat25RF, smetadat$Treatment, palette = treatcol, xlim = c(-0.7,0.6), ylim = c(-0.6,0.65))
+ordiellipse(plotx, smetadat$Treatment,conf=0.95,col=treatcol,lwd=2,draw="lines")
+
+#Calculate ranks
+treatranks<-cbind(apply(treatcomp[1:25,1:5], 2, function(x) rev(rank(x))))
+```
+
+###Experiment random forest
+```{r randomForest-experiment}
+#Optimise number of trees
+plot(randomForest(samples, y=smetadat$Exp, proximity = F, keep.forest = F, ntree=100000))
+#Optimise number of variables m (substitute your choice of tree number for ntree)
+cv.exp<-rfcv(samples, smetadat$Exp, cv.fold = 10, ntree = 10000)
+plot(cv.exp$error.cv~cv.exp$n.var, type = "S", xlab = "No. variables", ylab = "Error rate", ylim = c(0,1), main = "RFCV")
+#Run the random forest
+expRF<-randomForest(samples, y=smetadat$Exp, importance = T, proximity = T, mtry = 30, ntree=10000, keep.forest = TRUE)
+expRF
+
+plot(expRF)
+#Plot importance of all compounds
+varImpPlot(expRF, n.var=ncol(samples), labels = c(1:ncol(samples)))
+#Zoom in on the top 50
+varImpPlot(expRF, n.var=50)
+
+#Take the top 25 most informative compounds
+expcomp<-as.data.frame(importance(expRF))
+expcomp<-expcomp[order(expcomp$MeanDecreaseAccuracy, decreasing = T),]
+exp25<-samples[,names(samples) %in% row.names(expcomp)[1:25]]
+#Make another random forest with them
+exp25RF<-randomForest(exp25, y=smetadat$Exp, importance = T, proximity = T, ntree=10000)
+exp25RF
+#Plotit
+plotx<-MDSplot(exp25RF, smetadat$Exp, palette = expcol, xlim = c(-0.7,0.6), ylim = c(-0.6,0.65))
+ordiellipse(plotx, smetadat$Exp,conf=0.95,col=expcol,lwd=2,draw="lines")
+```
+
+###Compare the most informative compounds for treatment and experiment
+```{r randomForest-comparison}
+sum(rownames(expcomp)[1:25] %in% rownames(treatcomp)[1:25])
+
+rownames(expcomp)[1:25][rownames(expcomp)[1:25] %in% rownames(treatcomp)[1:25]]
+```
+
+###Create a combined ordination diagram (Fig 1)
+```{r Fig1}
+{pdf("./Results/MDS-combined.pdf", height = 4, width = 12)
+par(mfrow = c(1,3))
+#Variety
+plotx<-MDSplot(varRF, smetadat$Variety,palette = varcol, xlim = c(-0.55,0.45), ylim = c(-0.4,0.4))
+ordiellipse(plotx, smetadat$Variety,conf=0.95,col=varcol,lwd=2,draw="lines")
+legend("topleft",  c("AberClyde", "AberDart", "AberEcho", "AberGlyn", "AberNiche", 
+                     "AberZeus", "Barolex", "Bx511", "DaVinci", "Premium"), pch=c(20), bty="n", cex=0.8, col=varcol)
+mtext("(a)", side=3, adj=-0.2)
+#Treatment
+plotx<-MDSplot(treatRF, smetadat$Treatment, palette = treatcol, xlim = c(-0.9,0.45), ylim = c(-0.6,0.6))
+ordiellipse(plotx, smetadat$Treatment,conf=0.95,col=treatcol,lwd=2,draw="lines")
+legend("topleft",  c("Control 2020", "Control 2050","Drought","Flood","Heat"), pch=c(20), bty="n", cex=0.8, col=treatcol)
+mtext("(b)", side=3, adj=-0.2)
+#Experiment
+plotx<-MDSplot(expRF, smetadat$Exp, palette = expcol, xlim = c(-0.65,0.65), ylim = c(-0.65,0.7))
+ordiellipse(plotx, smetadat$Exp,conf=0.95,col=expcol,lwd=2,draw="lines")
+legend("topleft",  c("Exp1", "Exp2","Exp3"), pch=c(20), bty="n", cex=0.8, col=expcol)
+mtext("(c)", side=3, adj=-0.2)
+dev.off()
+}
+```
+
+###Create Table S3 - compounds used in the reduced panels for treatment and experiment
+```{r TableS3}
+tabS3<-matrix(NA, ncol = 3, nrow = 25)
+tabS3[,1]<-rownames(treatcomp)[1:25]
+tabS3[,2]<-rownames(expcomp)[1:25]
+tabS3[1:7,3]<-rownames(treatcomp)[1:25][rownames(treatcomp)[1:25] %in% rownames(expcomp)[1:25]]
+write.table(tabS3, file = "./Results/SuppMat/TableS3.csv",row.names=FALSE, na="", col.names=c("Treatment", "Experiment", "Overlap"), sep=",")
+```
+
+###Create Table XX - compounds used in the reduced panel for treatment
+```{r TableXX}
+tabXX<-matrix(nrow = 25)
+for (i in 1:5){
+  tabXX<-cbind(tabXX, 
+               sapply(row.names(treatcomp)[1:25], function(x) mean(samples[smetadat$Treatment==levels(smetadat$Treatment)[i], colnames(samples)== x] )),
+               treatranks[,i])
+}
+tabXX<-tabXX[,-1]
+row.names(tabXX)<-row.names(treatcomp)[1:25]
+colnames(tabXX)<-c("Abund.cntr20", "Rank.cntr20", 
+                "Abund.cntr50", "Rank.cntr50", 
+                "Abund.drought", "Rank.drought", 
+                "Abund.flood", "Rank.flood", 
+                "Abund.heat", "Rank.heat")
+tabXX<-apply(tabXX, 2, signif, digits = 3)
+write.table(tabXX, file = "./Results/TableXX.csv",row.names=T, sep=",")
+```
+
+#Metacoder based on RandomForests
+Plot which compounds contributed the most to the classification
+```{r rf-metacoder}
+
+set.seed(47)
+voctaxmap %>%
+  filter_taxa(taxon_names(voctaxmap) %in% c(rownames(treatcomp)[1:25], rownames(expcomp)[1:25]), supertaxa = T) %>%
+  heat_tree(node_size = sum_abund,
+            node_color = sum_abund,
+            node_color_axis_label = "Relative abundance",
+            node_label_size_trans = "log10 area",
+            initial_layout = "re", layout = "da",
+            overlap_avoidance = 0.76,
+            node_label = taxon_names)
+
+```
+###Metacoder for treatment RF
+```{r RF-metacoder-treatment}
+#Invert data
+imp<-as.data.frame(importance(treatRF))
+
+#Check compound names match
+rownames(imp)[!rownames(imp) %in% chemtax$Name]
+chemtax$Name[!chemtax$Name %in% rownames(imp)]
+
+#Check that the order is the same
+all.equal(as.character(chemtax$Name), as.character(rownames(imp)), check.attributes = FALSE)
+
+#Add taxonomy column to the data frame
+imp$taxonomy<-chemtax$Taxon
+
+#Take only the most important 24 compounds
+imp<-imp[order(imp$MeanDecreaseAccuracy, decreasing = T)[1:24],]
+
+#Create taxmap object
+rf.treat.taxmap <- parse_tax_data(imp,
+                            class_cols = "taxonomy", # The column in the input table
+                            class_sep = "|", # What each taxon is seperated by
+                            class_regex = "([a-z]{1}[0-9]{1})_(.*)",
+                            class_key = c("tax_rank" = "taxon_rank", "name" = "taxon_name"))
+rf.treat.taxmap
+
+rf.treat.taxmap$data$tax_data <- calc_taxon_abund(rf.treat.taxmap, "tax_data")
+
+heat_tree(rf.treat.taxmap,
+          node_label = taxon_names,
+          node_size = MeanDecreaseAccuracy,
+          node_color = MeanDecreaseAccuracy,
+          node_color_axis_label = "Importance",
+          overlap_avoidance = 0.78)
+
+imp20<-heat_tree(rf.treat.taxmap,
+          node_label = taxon_names,
+          node_size = cntr20,
+          node_color = cntr20,
+          node_color_axis_label = "Importance",
+          title= "Control 2020",
+          overlap_avoidance = 0.78)
+
+imp50<-heat_tree(rf.treat.taxmap,
+          node_label = taxon_names,
+          node_size = cntr50,
+          node_color = cntr50,
+          node_color_axis_label = "Importance",
+          title= "Control 2050",
+          overlap_avoidance = 0.78)
+
+imp.drought<-heat_tree(rf.treat.taxmap,
+          node_label = taxon_names,
+          node_size = drought,
+          node_color = drought,
+          node_color_axis_label = "Importance",
+          title= "Drought",
+          overlap_avoidance = 0.78)
+
+imp.flood<-heat_tree(rf.treat.taxmap,
+          node_label = taxon_names,
+          node_size = flood,
+          node_color = flood,
+          node_color_axis_label = "Importance",
+          title= "Flood",
+          overlap_avoidance = 0.78)
+
+imp.heat<-heat_tree(rf.treat.taxmap,
+          node_label = taxon_names,
+          node_size = heat,
+          node_color = heat,
+          node_color_axis_label = "Importance",
+          title= "Heat shock",
+          overlap_avoidance = 0.78)
+
+pdf("./Results/treat-RF-metacoder.pdf", height=8, width=12)
+multiplot(imp20,imp.flood,imp50,imp.heat,imp.drought, NULL, cols=3)
+dev.off()
+```
+
+###Metacoder for experiment RF
+```{r RF-metacoder-experiment}
+#Invert data
+imp.exp<-as.data.frame(importance(expRF))
+
+#Check compound names match
+rownames(imp.exp)[!rownames(imp.exp) %in% chemtax$Name]
+chemtax$Name[!chemtax$Name %in% rownames(imp.exp)]
+
+#Check that the order is the same
+all.equal(as.character(chemtax$Name), as.character(rownames(imp.exp)), check.attributes = FALSE)
+
+#Add taxonomy column to the data frame
+imp.exp$taxonomy<-chemtax$Taxon
+
+#Take only the most imp.exportant 25 compounds
+imp.exp<-imp.exp[order(imp.exp$MeanDecreaseAccuracy, decreasing = T)[1:25],]
+
+#Create taxmap object
+rf.exp.taxmap <- parse_tax_data(imp.exp,
+                            class_cols = "taxonomy", # The column in the input table
+                            class_sep = "|", # What each taxon is seperated by
+                            class_regex = "([a-z]{1}[0-9]{1})_(.*)",
+                            class_key = c("tax_rank" = "taxon_rank", "name" = "taxon_name"))
+rf.exp.taxmap
+
+names(rf.exp.taxmap$data$tax_data) <- c("taxon_id", "Exp1", "Exp2", "Exp3", "MeanDecreaseAccuracy",
+                                        "MeanDecreaseGini", "taxonomy")
+rf.exp.taxmap$data$tax_data <- calc_taxon_abund(rf.exp.taxmap, "tax_data")
+
+imp.exp1<-heat_tree(rf.exp.taxmap,
+          node_label = taxon_names,
+          node_size = Exp1,
+          node_color = Exp1,
+          node_color_axis_label = "Importance",
+          title= "Experiment 1",
+          overlap_avoidance = 0.78)
+
+imp.exp2<-heat_tree(rf.exp.taxmap,
+          node_label = taxon_names,
+          node_size = Exp2,
+          node_color = Exp2,
+          node_color_axis_label = "Importance",
+          title= "Experiment 2",
+          overlap_avoidance = 0.78)
+
+imp.exp3<-heat_tree(rf.exp.taxmap,
+          node_label = taxon_names,
+          node_size = Exp3,
+          node_color = Exp3,
+          node_color_axis_label = "Importance",
+          title= "Experiment 3",
+          overlap_avoidance = 0.78)
+
+pdf("./Results/FigS1.pdf", height=4, width=12)
+multiplot(imp.exp1, imp.exp2, imp.exp3, cols=3)
+dev.off()
+```
+
+#Build supplementary list of compounds
+```{r supp-tab}
+param<-read.csv("./Results/SuppMat/TableS1_parameterSet_combined190618.csv")
+param$name<-gsub("\n", "", param$name)
+#Rename compounds marked only with RI
+{param$name[param$name=="RI=1005.6,  23.4950 min 190126_9"]<-"Alkene1"
+param$name[param$name=="RI=1012.0,  23.7633 min 190214_13"]<-"Alkene2"
+param$name[param$name=="RI=1439.7,  39.7840 min 190124_3"]<-"Alkene3"
+param$name[param$name=="RI=1818.0,  50.9000 min 190129_12"]<-"Acid1"
+param$name[param$name=="RI=2202.5,  60.5763 min 190213_10"]<-"Alcohol1"
+param$name[param$name=="RI=872.2,  17.4033 min 190127_14"]<-"Amide1"
+param$name[param$name=="RI=1972.2,  54.8386 min 190129_9"]<-"Sulfone1"
+param$name[param$name=="RI=2153.0,  59.3436 min 190212_4"]<-"Biphenyl1"
+param$name<-gsub(" - custom","",param$name)
+}
+param<-param[param$name %in% chemtax$AMDISname,]
+
+#Add in RIs
+batch<-read.delim("190415NETCDF.txt")
+param$RI<-batch$RI[match(round(param$RT,1), round(batch$RT,1))]
+param<-param[,c("name",  "RI",  "RT", "lOffset", "rOffset", "QIon",  "ValIon1", "ValIon2")]
+#Add the group information
+param<-cbind(param,chemtax[match(param$name, chemtax$AMDISname),-c(1:2)])
+#Add the importance from treatment RF
+param<-cbind(param,treatcomp[match(param$IUPAC.name, rownames(treatcomp)),])
+#Add the importance from experiment RF
+param<-cbind(param,expcomp[match(param$IUPAC.name, rownames(expcomp)),])
+
+names(param)<-c("AMDIS.name",names(param)[2:15],"MDA.cntr20", "MDA.cntr50", "MDA.drought", "MDA.flood", "MDA.heat", "MeanDecreaseAccuracy.Condition", "MeanDecreaseGini.Condition", "MDA.R1", "MDA.R2", "MDA.R3", "MeanDecreaseAccuracy.Rep", "MeanDecreaseGini.Rep" )
+
+write.csv(param, "./Results/SuppMatTableVOCS1.csv", row.names = F)
+```
